@@ -1,0 +1,1746 @@
+---
+title: "MidTerm_EDA_2"
+author: "Kyle Evans"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Apologies in advanced for the length of this file. I really went down the rabbit hole with trying different modeling and feature selection processes. Much of this code may be repetitive, but I felt it would be best to keep it in here to show progression. I would very often try something, then figure out a much quicker or better way to do it several days later.
+
+First, I read in the data. Next, I convert categorical vars to factors and do some Log transformations to a new var on the number data. Once that is done, I remove any column that just has a single unique value. If it's the same across attrition yes and no, then it won't be of any value in prediction for us.
+
+Next, I train my final mode and output predictions. All chunks after this one are supporting the data analysis, features selection, and model testing.
+
+```{r dataimport}
+
+library(data.table)
+library(tidyverse)
+library(caret)
+
+data_raw <- fread('CaseStudy1-data.csv')
+
+data_main = data_raw %>% mutate (
+  Attrition = relevel(factor(Attrition), ref = "Yes"),
+  #AttritionNum = ifelse(Attrition == "Yes", 1, 0),
+  BusinessTravel = as_factor(BusinessTravel),
+  Department = as_factor(Department),
+  EducationField = as_factor(EducationField),
+  Gender = as_factor(Gender),
+  JobLevel = as_factor(JobLevel),
+  JobRole = as_factor(JobRole),
+  MaritalStatus = as_factor(MaritalStatus),
+  Over18 = as_factor(Over18),
+  OverTime = as_factor(OverTime),
+  StockOptionLevel = as_factor(StockOptionLevel),
+  DailyRateLog_L = log(DailyRate),
+  DistanceFromHome_L = log(DistanceFromHome),
+  HourlyRateLog_L = log(HourlyRate),
+  MonthlyIncome_L = log(MonthlyIncome),
+  MonthlyRate_L = log(MonthlyRate),
+  PercentSalaryHike_L = log(PercentSalaryHike),
+  Education = factor(Education, levels = c(1,2,3,4,5), labels = c("Below College", "College", "Bachelor", "Master", "Doctor")),
+  EnvironmentSatisfaction = factor(EnvironmentSatisfaction, levels = c(1,2,3,4), labels = c("Low","Medium", "High", "Very High")),
+  JobInvolvement = factor(JobInvolvement, levels = c(1,2,3,4), labels = c("Low","Medium", "High", "Very High")),
+  JobSatisfaction = factor(JobSatisfaction, levels = c(1,2,3,4), labels = c("Low","Medium", "High", "Very High")),
+  PerformanceRating = factor(PerformanceRating, levels = c(1,2,3,4), labels = c("Low","Good", "Excellent", "Outstanding")),
+  RelationshipSatisfaction = factor(RelationshipSatisfaction, levels = c(1,2,3,4), labels = c("Low","Medium", "High", "Very High")),
+  WorkLifeBalance = factor(WorkLifeBalance, levels = c(1,2,3,4), labels = c("Bad","Good", "Better", "Best")),
+)
+
+#get the columns that have the same data in all, we can ignore those
+single_level <- sapply(data_main, function(x) length(unique(x)) == 1)
+
+#get rid of those columns
+data_cleaned <- data_main[, names(data_main)[!single_level], with = FALSE]
+
+data_categorical <- data_cleaned %>% mutate_if(is.character, ~ as.factor(.)) %>% select_if(is.factor)
+data_continuous <- data_cleaned %>% select_if(is.numeric)
+
+data_all <- cbind(data_categorical, data_continuous)
+
+
+## useful functions
+
+generate_seeds <- function(tuneGrid, resampling_method = "cv", resampling_number = 10, adaptive = FALSE, repeats = NULL) {
+  # Determine the number of tuning parameter combinations
+  if (!is.null(tuneGrid)) {
+    num_tuning_combinations <- nrow(tuneGrid)
+  } else {
+    stop("tuneGrid cannot be NULL.")
+  }
+  
+  # Initialize the list to store seeds
+  seeds <- NULL
+  
+  # Generate seeds based on the resampling method
+  if (adaptive) {
+   
+    max_resamples <- resampling_number
+    seeds <- vector(mode = "list", length = max_resamples + 1)
+    
+    for (i in 1:max_resamples) {
+     
+      seeds[[i]] <- sample.int(n = 1000000, size = num_tuning_combinations)
+    }
+  } else if (resampling_method %in% c("cv", "repeatedcv")) {
+    if (resampling_method == "cv") {
+      seeds <- vector(mode = "list", length = resampling_number + 1)
+      
+      for (i in 1:resampling_number) {
+        seeds[[i]] <- sample.int(n = 1000000, size = num_tuning_combinations)
+      }
+    } else if (resampling_method == "repeatedcv") {
+      if (is.null(repeats)) {
+        stop("For repeated cross-validation, 'repeats' must be specified.")
+      }
+      total_iterations <- resampling_number * repeats
+      seeds <- vector(mode = "list", length = total_iterations + 1)
+      
+      for (i in 1:total_iterations) {
+        seeds[[i]] <- sample.int(n = 1000000, size = num_tuning_combinations)
+      }
+    }
+  } else {
+    stop("Resampling method not supported in this function.")
+  }
+  
+  # For the final model
+  seeds[[length(seeds)]] <- sample.int(n = 1000000, size = 1)
+  
+  return(seeds)
+}
+
+find_best_threshold <- function(pred_probs, true_labels, thresholds) {
+ 
+  thres_res <- data.frame(threshold = numeric(), Sensitivity = numeric(), Accuracy = numeric())
+  
+  for (threshold in thresholds) {
+   
+    pred_class <- ifelse(pred_probs > threshold, "Yes", "No")  
+    
+    pred_class <- factor(pred_class, levels = c("Yes", "No"))
+    # Generate a confusion matrix
+    cm <- confusionMatrix(pred_class, factor(true_labels), positive = "Yes")  
+    
+    # Extract metrics (Sensitivity, Specificity, Accuracy)
+    Sensitivity <- cm$byClass["Sensitivity"]
+    Specificity <- cm$byClass["Specificity"]
+    Accuracy <- cm$overall["Accuracy"]
+    
+    # Store the results for the current threshold
+    thres_res <- rbind(thres_res,
+                     data.frame(threshold, Sensitivity, Specificity, Accuracy))
+  }
+  
+  # Find the threshold with the best sum of Sensitivity + Specificity (you can customize this criterion)
+  thres_res$sum_sens_spec <- thres_res$Sensitivity + thres_res$Specificity
+  best_threshold_row <- thres_res[which.max(thres_res$sum_sens_spec), ]
+  
+  # Return the best threshold and its corresponding metrics
+  return(best_threshold_row)
+}
+
+eval_model <- function(model, test_data, answers, posclass) {
+  modelData <- model$bestTune
+  modelData$sampleType <- model$control$sampling$name
+  modelData$predictors <- paste(predictors(model), collapse = ",")
+  
+  model_thresholds <- thresholder(model, threshold = seq(.1, .9, by = .01))
+  best_model_threshold <- model_thresholds[which.max(model_thresholds$Sensitivity + model_thresholds$Specificity), ]
+  
+  test_predictions_prob <- predict(model, (test_data %>% dplyr::select(-!!sym(answers))), type = "prob")
+  best_actual_threshold <- find_best_threshold(test_predictions_prob[[posclass]],
+                                               test_data$Attrition ,
+                                               threshold = seq(.1, .9, by = .01))
+  
+  
+  
+  
+  
+  df <- data.frame(
+    model = modelData$sampleType,
+    predicted_threshold = best_model_threshold$prob_threshold,
+    predicted_acc = best_model_threshold$Accuracy,
+    predicted_sen = best_model_threshold$Sensitivity,
+    predicted_spec = best_model_threshold$Specificity,
+    predicted_roc = model$results$ROC,
+    actual_threshold = best_actual_threshold$threshold,
+    actual_acc = best_actual_threshold$Accuracy,
+    actual_sen = best_actual_threshold$Sensitivity,
+    actual_spec = best_actual_threshold$Specificity,
+    features = modelData$predictors,
+    fL = model$bestTune$fL,
+    usekernel = model$bestTune$usekernel,
+    adjust = model$bestTune$adjust
+  )
+  
+  return(df)
+  
+}
+
+sort_features <- function(x) {
+  
+  features_list <- strsplit(x, ",")[[1]]
+  
+  features_list <- trimws(features_list)
+ 
+  features_list <- sort(features_list)
+ 
+  features_str <- paste(features_list, collapse = ",")
+  
+  return(features_str)
+}
+
+
+
+#final predictions
+
+f <- data.frame(
+  features = c(
+    "Age,JobInvolvement,JobRole,JobSatisfaction,MonthlyIncome_L,OverTime,StockOptionLevel,WorkLifeBalance"
+  ),
+  model = c("up"),
+  usekernel = c(TRUE),
+  adjust = c(3),
+  fL = c(3)
+)
+
+
+train_data <- data_all
+
+nzv <- nearZeroVar(train_data, saveMetrics = TRUE)
+nzv_to_remove <- which(nzv$zeroVar == TRUE | nzv$nzv == TRUE)
+columns_to_remove <- colnames(train_data)[nzv_to_remove]
+train_data <- train_data %>% dplyr::select(-dplyr::all_of(columns_to_remove))
+preprocess_steps <- preProcess(train_data, method = c("center", "scale", "nzv"))
+train_data_processed <- predict(preprocess_steps, train_data)
+
+
+test_data_raw <- fread('CaseStudy1CompSet No Attrition.csv')
+
+test_main <- test_data_raw %>% mutate (
+  BusinessTravel = as_factor(BusinessTravel),
+  Department = as_factor(Department),
+  EducationField = as_factor(EducationField),
+  Gender = as_factor(Gender),
+  JobLevel = as_factor(JobLevel),
+  JobRole = as_factor(JobRole),
+  MaritalStatus = as_factor(MaritalStatus),
+  Over18 = as_factor(Over18),
+  OverTime = as_factor(OverTime),
+  StockOptionLevel = as_factor(StockOptionLevel),
+  DailyRateLog_L = log(DailyRate),
+  DistanceFromHome_L = log(DistanceFromHome),
+  HourlyRateLog_L = log(HourlyRate),
+  MonthlyIncome_L = log(MonthlyIncome),
+  MonthlyRate_L = log(MonthlyRate),
+  PercentSalaryHike_L = log(PercentSalaryHike),
+  Education = factor(Education, levels = c(1,2,3,4,5), labels = c("Below College", "College", "Bachelor", "Master", "Doctor")),
+  EnvironmentSatisfaction = factor(EnvironmentSatisfaction, levels = c(1,2,3,4), labels = c("Low","Medium", "High", "Very High")),
+  JobInvolvement = factor(JobInvolvement, levels = c(1,2,3,4), labels = c("Low","Medium", "High", "Very High")),
+  JobSatisfaction = factor(JobSatisfaction, levels = c(1,2,3,4), labels = c("Low","Medium", "High", "Very High")),
+  PerformanceRating = factor(PerformanceRating, levels = c(1,2,3,4), labels = c("Low","Good", "Excellent", "Outstanding")),
+  RelationshipSatisfaction = factor(RelationshipSatisfaction, levels = c(1,2,3,4), labels = c("Low","Medium", "High", "Very High")),
+  WorkLifeBalance = factor(WorkLifeBalance, levels = c(1,2,3,4), labels = c("Bad","Good", "Better", "Best")),
+)
+
+
+preprocess_steps <- preProcess(test_main, method = c("center", "scale", "nzv"))
+test_data_processed <- predict(preprocess_steps, test_main)
+
+
+tune_grid <- expand.grid(
+  fL = f$fL,
+  # Laplace smoothing parameter
+  usekernel = f$usekernel,
+  # Use kernel density estimates
+  adjust = f$adjust       # Bandwidth adjustment for density estimation
+)
+
+
+m_data <- train_data_processed %>% dplyr::select(all_of(strsplit(f$features, ",")[[1]]), "Attrition")
+m_data_test <- test_data_processed %>% dplyr::select(all_of(strsplit(f$features, ",")[[1]]))
+m_data_test$Id <- test_main$ID
+
+folds = 10
+repeats = 5
+
+control <- trainControl(
+  method = "repeatedcv",
+  number = folds,
+  repeats = repeats,
+  summaryFunction = twoClassSummary,
+  sampling = f$model,
+  allowParallel = TRUE,
+  savePredictions = 'final',
+  classProbs = TRUE,
+  #seeds = seeds,
+  search = "grid"
+  #adaptive = list(min = 3, alpha = 0.05, method = "gls", complete = TRUE)
+)
+f_model <- train(
+  m_data %>% dplyr::select(-Attrition),
+  m_data$Attrition,
+  method = "nb",
+  trControl = control,
+  tuneGrid = tune_grid,
+  metric = "ROC"
+)
+
+predictions <- predict(f_model, newdata = m_data_test)
+
+pred_data <- cbind(m_data_test, predictions) %>% mutate(Attrition = predictions) %>% select(Id, Attrition)
+
+write_csv(pred_data, "Case1PredictionsEVANS Attrition.csv")
+
+```
+
+Intro plot for EDA.
+
+```{r}
+
+library(DataExplorer)
+#library(SmartEDA)
+
+data_raw <- fread('CaseStudy1-data.csv')
+
+data_raw <- data_raw %>% mutate (
+  Attrition = relevel(factor(Attrition), ref = "Yes"),
+  BusinessTravel = as_factor(BusinessTravel),
+  Department = as_factor(Department),
+  EducationField = as_factor(EducationField),
+  Gender = as_factor(Gender),
+  JobLevel = as_factor(JobLevel),
+  JobRole = as_factor(JobRole),
+  MaritalStatus = as_factor(MaritalStatus),
+  Over18 = as_factor(Over18),
+  OverTime = as_factor(OverTime),
+  StockOptionLevel = as_factor(StockOptionLevel),
+  Education = factor(Education, levels = c(1,2,3,4,5), labels = c("Below College", "College", "Bachelor", "Master", "Doctor")),
+  EnvironmentSatisfaction = factor(EnvironmentSatisfaction, levels = c(1,2,3,4), labels = c("Low","Medium", "High", "Very High")),
+  JobInvolvement = factor(JobInvolvement, levels = c(1,2,3,4), labels = c("Low","Medium", "High", "Very High")),
+  JobSatisfaction = factor(JobSatisfaction, levels = c(1,2,3,4), labels = c("Low","Medium", "High", "Very High")),
+  PerformanceRating = factor(PerformanceRating, levels = c(1,2,3,4), labels = c("Low","Good", "Excellent", "Outstanding")),
+  RelationshipSatisfaction = factor(RelationshipSatisfaction, levels = c(1,2,3,4), labels = c("Low","Medium", "High", "Very High")),
+  WorkLifeBalance = factor(WorkLifeBalance, levels = c(1,2,3,4), labels = c("Bad","Good", "Better", "Best")),
+)
+
+
+p_intro <- DataExplorer::plot_intro(data_raw) +
+          theme_minimal() +
+          theme(legend.position="none") +
+        labs(title = "Data Overview", x = "", y = "") +
+          theme(
+             
+             axis.text.x = element_text(face="bold", size = 18)
+            ,axis.text.y = element_text(face="bold", size = 15)
+            ,title =  element_text(face="bold", size = 20)
+            ) +
+      scale_fill_manual(values=c("#e97132",
+                             "#1c6b24", 
+                             "#1d6082")) 
+ 
+
+p_intro
+```
+
+Chi Squared Tests
+
+```{r}
+
+preprocess_steps <- preProcess(data_all, method = c("center", "scale", "nzv"))
+chi_data <- predict(preprocess_steps, data_all)
+
+perform_chisq_test <- function(cat_var) {
+  
+  cat_var_name <- deparse(substitute(cat_var))
+
+  
+  table_attrition <- table(chi_data$Attrition, cat_var)
+  
+  
+  result <- tryCatch({
+    
+    test_result <- chisq.test(table_attrition)
+  
+    return(test_result$p.value)
+    
+  }, warning = function(w) {
+    
+    if (grepl("Chi-squared approximation may be incorrect", w$message)) {
+     
+      message(paste("Warning: Chi-squared approximation may be incorrect for:", cat_var_name))
+      return(1)  
+    } else {
+      
+      warning(w)
+    }
+  }, error = function(e) {
+    
+    message(paste("Error in processing:", cat_var_name, "-", e$message))
+    return(1)
+  })
+  
+  return(result)
+}
+
+
+cat_vars <- chi_data %>%
+  select(-Attrition)  # Remove attrition from the list
+
+
+chisq_results <- sapply(cat_vars, perform_chisq_test)
+
+chisq_results_df <- data.frame(
+  Variable = names(chisq_results),
+  P_Value = as.numeric(chisq_results),
+  stringsAsFactors = FALSE
+)
+
+# Sort the results by p-value in ascending order
+chisq_results_sorted <- chisq_results_df[order(chisq_results_df$P_Value), ]
+
+chisq_results_sorted$P_Value <- format(chisq_results_sorted$P_Value, scientific = TRUE)
+
+# Display the sorted results
+print(chisq_results_sorted)
+
+```
+
+Plots for Slides
+
+```{r}
+
+library(ggplot2)
+
+p1_data <- data_all %>% 
+  group_by(OverTime) %>%
+  summarise(AttritionYesPercent = mean(Attrition == "Yes") * 100)
+
+# Plotting
+p1 <- ggplot(p1_data, aes(x = OverTime, y = AttritionYesPercent)) +
+  geom_bar(stat = "identity", fill = "#1d6082") +
+  geom_text(aes(label = paste0(round(AttritionYesPercent, 1), "%")), 
+            vjust = -0.1, size = 10, fontface = "bold", hjust = 1.5, color = "white") +  # Label settings
+  labs(
+    x = "OverTime",
+    y = "Percentage of Attrition (Yes)",
+    title = "Attrition Percentage by OverTime"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 20, face = "bold"),  # Increase font size and make it bold
+    axis.title = element_text(size = 22, face = "bold"),
+    axis.text = element_text(size = 20, face = "bold"),
+    plot.title = element_text(size = 24, face = "bold", hjust = 0.5)
+  )+
+  coord_flip()
+
+plot(p1)
+
+
+
+p2_data <- data_all %>% 
+  group_by(StockOptionLevel) %>%
+  summarise(AttritionYesPercent = mean(Attrition == "Yes") * 100)
+
+# Plotting
+p2 <- ggplot(p2_data, aes(x = StockOptionLevel, y = AttritionYesPercent)) +
+  geom_bar(stat = "identity", fill = "#1c6b24") +
+  geom_text(aes(label = paste0(round(AttritionYesPercent, 1), "%")), 
+            vjust = 0.5, size = 8, fontface = "bold", hjust = 1.1, color = "white") +  # Label settings
+  labs(
+    x = "Stock Option Level",
+    y = "Percentage of Attrition (Yes)",
+    title = "Attrition Percentage by Stock Option Level"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 20, face = "bold"),  # Increase font size and make it bold
+    axis.title = element_text(size = 22, face = "bold"),
+    axis.text = element_text(size = 20, face = "bold"),
+    plot.title = element_text(size = 24, face = "bold", hjust = 0.5)
+  )+
+  coord_flip()
+
+p2
+
+
+  p3_data <- data_all %>% 
+  group_by(JobInvolvement) %>%
+  summarise(AttritionYesPercent = mean(Attrition == "Yes") * 100)
+
+# Plotting
+
+  p3 <- ggplot(p3_data, aes(x = JobInvolvement, y = AttritionYesPercent)) +
+  geom_bar(stat = "identity", fill = "#e97132") +
+  geom_text(aes(label = paste0(round(AttritionYesPercent, 1), "%")), 
+            vjust = 0.5, size = 8, fontface = "bold", hjust = 1.1, color = "white") +  # Label settings
+  labs(
+    x = "Job Involvement",
+    y = "Percentage of Attrition (Yes)",
+    title = "Attrition Percentage by Job Involvement"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 20, face = "bold"),  # Increase font size and make it bold
+    axis.title = element_text(size = 22, face = "bold"),
+    axis.text = element_text(size = 20, face = "bold"),
+    plot.title = element_text(size = 24, face = "bold", hjust = 0.5)
+  )+
+  coord_flip()
+
+p3
+
+
+```
+
+This was my first attempt at testing combinations of the columns I identified as "candidate" predictors after chisquare and visual analysis.
+
+```{r attempt1}
+
+library(stringr)
+library(combinat)
+library(e1071)
+library(caret)
+library(doParallel)
+library(foreach)
+library(data.table)
+library(smotefamily)
+library(dplyr)
+
+
+candidate_data <- train_data_processed %>% dplyr::select(OverTime, MonthlyIncome_L, Department, Gender, JobInvolvement, JobLevel, JobRole, JobSatisfaction, MaritalStatus, Age, StockOptionLevel, YearsWithCurrManager, WorkLifeBalance, TotalWorkingYears, YearsAtCompany, Attrition)
+
+
+num_columns <- ncol(candidate_data) - 1
+folds <- 10
+num_cores <- detectCores() - 2  
+
+start_time <- Sys.time()
+
+results_list <- list()
+
+final_results <- data.table()
+
+seeds <- vector("list", length = folds + 1)
+
+set.seed(12345)
+for(i in 1:folds) {
+  seeds[[i]] <- sample.int(1000, 42)
+}
+
+seeds[[folds + 1]] <- sample.int(1000, 1) 
+
+control_u <- trainControl(method = "cv", number = folds, summaryFunction = customSummary, sampling = "up", seeds = seeds, allowParallel = TRUE)  
+control_d <- trainControl(method = "cv", number = folds, summaryFunction = customSummary, sampling = "down", seeds = seeds, allowParallel = TRUE)  
+control_r <- trainControl(method = "cv", number = folds, summaryFunction = customSummary, sampling = "rose", seeds = seeds, allowParallel = TRUE)  
+
+tune_grid <- expand.grid(fL = seq(0, 3, by = .5), usekernel = c(TRUE, FALSE), adjust = seq(1,3, by = 1)) 
+
+
+cl_outer <- makeCluster(num_cores)
+registerDoParallel(cl_outer)
+
+#loops through the different combinations we can have.  start at 2 to num_columns above
+outer_results <- foreach(n = 3:8, .combine = rbind, .packages = c("stringr", "combinat", "e1071", "caret", 'dplyr', 'foreach', 'data.table', 'doParallel'), .inorder = FALSE) %do% {
+  
+  #every way we can chose n from the number of columns we have
+  feature_combinations <- combn(1:num_columns, n, simplify = FALSE)
+  
+  #test each combination
+  inner_results_list <- foreach(features = feature_combinations, .combine = rbind, .packages = c("stringr", "e1071", "caret", 'dplyr', 'data.table', 'doParallel'), .inorder = FALSE) %dopar% {
+    
+    inner_results <- list()
+  
+    d <- candidate_data[, ..features]
+    #d_a <- cbind(d, Attrition = candidate_data$Attrition)
+    
+    up_cv_model <- train(d, candidate_data$Attrition, method = "nb", trControl = control_u, tuneGrid = tune_grid)$results
+    down_cv_model <- train(d, candidate_data$Attrition, method = "nb", trControl = control_d, tuneGrid = tune_grid)$results
+    rose_cv_model <- train(d, candidate_data$Attrition, method = "nb", trControl = control_r, tuneGrid = tune_grid)$results
+   
+    
+    up_cv_model$sampletype <- "up"
+    down_cv_model$sampletype <- "down"
+    rose_cv_model$sampletype <- "rose"
+    
+    res <- rbind(up_cv_model, down_cv_model, rose_cv_model) #%>% dplyr::select(-usekernel, -adjust, -PositiveClassSD)
+    res$num_features <- n
+    res$features <- paste(colnames(d), collapse = ",")
+    
+    inner_results <- rbindlist(list(inner_results, res), use.names = TRUE, fill = TRUE)
+    
+    inner_results
+       
+  }
+   
+  inner_results_list
+  
+} #end main
+
+
+stopCluster(cl_outer)
+
+results_df <- as.data.frame(outer_results)
+write.csv(results_df, "results_cv_testing_2.csv", row.names = FALSE)
+
+end_time <- Sys.time()
+execution_time <- end_time - start_time
+cat("Execution time:", execution_time, "\n")
+
+
+head(results_df)
+
+
+
+data_a <- fread('results_cv_testing_2.csv')
+
+data_a$PositiveClass <- as.factor(data_a$PositiveClass)
+data_a$features <- as.factor(data_a$features)
+data_a$num_features <- as.factor(data_a$num_features)
+data_a$sampletype <- as.factor(data_a$sampletype)
+data_a$fL <- as.factor(data_a$fL)
+
+head(data_a)
+
+
+data_a <- data_a %>% filter(Specificity >= .7 & Sensitivity >= .7)
+
+which.max(data_a$Accuracy)
+which.max(data_a$Sensitivity)
+which.max(data_a$Specificity)
+which.max(data_a$F1)
+which.max(data_a$Kappa)
+
+
+max_row1 <- data_a[which.max(data_a$Accuracy), ]
+max_row2 <- data_a[which.max(data_a$Sensitivity), ]
+max_row3 <- data_a[which.max(data_a$Specificity), ]
+max_row4 <- data_a[which.max(data_a$F1), ]
+max_row5 <- data_a[which.max(data_a$Kappa), ]
+
+max <- rbind(max_row1,max_row2,max_row3,max_row4, max_row5)
+
+write_csv(max, "best_models.csv", col_names = TRUE)
+
+print(max)
+
+```
+
+This code uses CARET recursive feature reduction as a way to see what predictors are best. Using this to cross-validate what I already found via ChiSquare tests and visual analysis. I learned that this is a greedy algorithm that starts will everything, then reduces the features to till it reaches a max. It may not be perfect though because if it first removes x then y, it doesn't recheck with x after.
+
+```{r}
+
+library(caret)
+library(foreach)
+library(parallel)
+library(dplyr)
+
+cl_outer <- makeCluster(num_cores)
+registerDoParallel(cl_outer)
+
+results <- list()
+
+itterations = 1:100
+
+foreach(i = itterations,
+        .combine = rbind,
+    .packages = c(
+      "stringr",
+      "combinat",
+      "e1071",
+      "caret",
+      'foreach',
+      'data.table',
+      'doParallel',
+      'dplyr'
+    ),
+    .inorder = FALSE
+        ) %do% {
+
+set.seed(i)
+                    
+train_indices <- createDataPartition(data_all$Attrition, p=0.8, list=FALSE)
+train_data <- data_all[train_indices, ]
+test_data <- data_all[-train_indices, ]
+
+nzv <- nearZeroVar(train_data, saveMetrics= T)
+
+nzv_to_remove <- which(nzv$zeroVar == TRUE | nzv$nzv == TRUE)
+
+columns_to_remove <- colnames(train_data)[nzv_to_remove]
+
+train_data <- train_data %>% dplyr::select(-all_of(columns_to_remove))
+
+preprocess_steps <- preProcess(train_data, 
+                               method = c("center", "scale", "nzv"))
+
+train_data_processed <- predict(preprocess_steps, train_data)
+
+nbFuncs$summary <- defaultSummary
+
+control <- rfeControl(functions = nbFuncs,
+                      method = "repeatedcv",
+                      number = 10)
+
+nbProfile <- rfe(x = train_data_processed %>% dplyr::select(-Attrition, -AttritionNum),
+                 y = train_data_processed$Attrition,
+                 sizes = c(3:18),
+                 rfeControl = control,
+                 metric = "Accuracy")
+
+df1 <- data.frame(features = paste(predictors(nbProfile), collapse = ","), metric = "Accuracy", seed = i)
+
+nbProfile <- rfe(x = train_data_processed %>% dplyr::select(-Attrition, -AttritionNum),
+                 y = train_data_processed$Attrition,
+                 sizes = c(3:18),
+                 rfeControl = control,
+                 metric = "Kappa")
+
+df2 <- data.frame(features = paste(predictors(nbProfile), collapse = ","), metric = "Kappa", seed = i)
+
+res <- rbind(df1, df2)
+
+results <- rbindlist(list(results, res), use.names = TRUE, fill = TRUE)
+
+}
+
+results_df <- as.data.frame(results)
+write.csv(results_df, "rfe_selections.csv", row.names = TRUE)
+
+
+# Get all active cluster objects
+active_clusters <- parallel:::getDefaultCluster()
+
+# Stop each active cluster
+if (!is.null(active_clusters)) {
+  for (cl in active_clusters) {
+    stopCluster(cl)
+  }
+}
+
+```
+
+This code uses CARET genetic algorithms as a way to see what predictors are best. Using this to cross-validate what I already found via ChiSquare tests and visual analysis. Plus, fun to just learn something new. This code can take a long time, so only did 10 iterations. Each iteration took 30 minutes on my machine. I learned that GA use the idea of evolution as an algorithm. Sort of having 1 generation, then going to the next, and then the next. each having the best number of "organisms" surviving.
+
+```{r}
+
+library(caret)
+library(foreach)
+library(parallel)
+library(dplyr)
+library(klaR)
+library(GA)
+
+num_cores = detectCores() - 3
+cl_outer <- makeCluster(num_cores)
+registerDoParallel(cl_outer)
+
+results <- list()
+
+itterations = 1:10
+
+foreach(i = itterations,
+        .combine = rbind,
+    .packages = c(
+      "stringr",
+      "combinat",
+      "e1071",
+      "caret",
+      'foreach',
+      'data.table',
+      'doParallel',
+      'dplyr'
+    ),
+    .inorder = FALSE
+        ) %do% {
+
+set.seed(i)
+                    
+train_indices <- createDataPartition(data_all$Attrition, p=0.8, list=FALSE)
+train_data <- data_all[train_indices, ]
+test_data <- data_all[-train_indices, ]
+
+nzv <- nearZeroVar(train_data, saveMetrics= T)
+
+nzv_to_remove <- which(nzv$zeroVar == TRUE | nzv$nzv == TRUE)
+
+columns_to_remove <- colnames(train_data)[nzv_to_remove]
+
+train_data <- train_data %>% dplyr::select(-all_of(columns_to_remove))
+
+preprocess_steps <- preProcess(train_data, 
+                               method = c("center", "scale", "nzv"))
+
+train_data_processed <- predict(preprocess_steps, train_data)
+
+
+tmp <- caretGA
+tmp$fitness_extern <- twoClassSummary
+
+control <- gafsControl(functions = tmp,
+                      metric = c(internal = "ROC", external = "ROC"),
+                      method = "cv",
+                      number = 10,
+                      genParallel = TRUE,
+                      allowParallel = TRUE,
+                      verbose = TRUE)
+
+train_ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  classProbs = TRUE,            # Needed for ROC metric
+  summaryFunction = twoClassSummary
+)
+
+tictoc::tic()
+nbProfile <- gafs(x = train_data_processed %>% dplyr::select(-Attrition, -AttritionNum),
+                 y = train_data_processed$Attrition,
+                 iters = 50,
+                 popSize = 20,
+                 gafsControl = control,
+                 method = "nb",
+                 metric = "ROC",
+                 trControl = train_ctrl
+                 )
+tictoc::toc()
+df2 <- data.frame(features = paste((nbProfile$optVariables), collapse = ","), metric = "ROC", seed = i)
+
+
+results <- rbindlist(list(results, df2), use.names = TRUE, fill = TRUE)
+
+}
+
+results_df <- as.data.frame(results)
+write.csv(results_df, "ga_selections.csv", row.names = TRUE)
+
+
+# Get all active cluster objects
+active_clusters <- parallel:::getDefaultCluster()
+
+# Stop each active cluster
+if (!is.null(active_clusters)) {
+  for (cl in active_clusters) {
+    stopCluster(cl)
+  }
+}
+
+```
+
+This code uses CARET simulated annealing for feature selection. It is modeled after the metallurgical process by which metals are heated and cooled to improve the properties. Interesting concept.
+
+```{r}
+
+library(caret)
+library(foreach)
+library(parallel)
+library(dplyr)
+library(klaR)
+library(GA)
+
+num_cores = detectCores() - 3
+cl_outer <- makeCluster(num_cores)
+registerDoParallel(cl_outer)
+
+results <- list()
+
+itterations = 1:50
+
+foreach(i = itterations,
+        .combine = rbind,
+    .packages = c(
+      "stringr",
+      "combinat",
+      "e1071",
+      "caret",
+      'foreach',
+      'data.table',
+      'doParallel',
+      'dplyr'
+    ),
+    .inorder = FALSE
+        ) %do% {
+
+set.seed(i)
+                    
+train_indices <- createDataPartition(data_all$Attrition, p=0.8, list=FALSE)
+train_data <- data_all[train_indices, ]
+test_data <- data_all[-train_indices, ]
+
+nzv <- nearZeroVar(train_data, saveMetrics= T)
+
+nzv_to_remove <- which(nzv$zeroVar == TRUE | nzv$nzv == TRUE)
+
+columns_to_remove <- colnames(train_data)[nzv_to_remove]
+
+train_data <- train_data %>% dplyr::select(-all_of(columns_to_remove))
+
+preprocess_steps <- preProcess(train_data, 
+                               method = c("center", "scale", "nzv"))
+
+train_data_processed <- predict(preprocess_steps, train_data)
+
+tmp <- caretSA
+tmp$fitness_extern <- twoClassSummary
+
+control <- safsControl(functions = tmp,
+                      metric = c(internal = "ROC", external = "ROC"),
+                      method = "cv",
+                      improve = 15,
+                      number = 5,
+                      allowParallel = TRUE,
+                      verbose = TRUE)
+
+train_ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  classProbs = TRUE,            
+  summaryFunction = twoClassSummary
+)
+
+tictoc::tic()
+nbProfile <- safs(x = train_data_processed %>% dplyr::select(-Attrition, -AttritionNum),
+                 y = train_data_processed$Attrition,
+                 iters = 100,
+                 safsControl = control,
+                 method = "nb",
+                 metric = "ROC",
+                 trControl = train_ctrl
+                 )
+tictoc::toc()
+df2 <- data.frame(features = paste((nbProfile$optVariables), collapse = ","), metric = "ROC", seed = i)
+
+
+results <- rbindlist(list(results, df2), use.names = TRUE, fill = TRUE)
+
+}
+
+results_df <- as.data.frame(results)
+write.csv(results_df, "sa_selections.csv", row.names = TRUE)
+
+
+# Get all active cluster objects
+active_clusters <- parallel:::getDefaultCluster()
+
+# Stop each active cluster
+if (!is.null(active_clusters)) {
+  for (cl in active_clusters) {
+    stopCluster(cl)
+  }
+}
+
+```
+
+This code takes a models file that is assumed to have a "features" column that is a comma delimited string of columns. It then uses the CARET library to test each model using ROC, which I learned is basically the same thing as testing different thresholds. Pretty cool!
+
+First, I take 20% of the data out to begin with, then use either cv or repatedcv to train a few different models on the remaining 80% using different sampling methods to account for the unbiased classes. I then test the models on the 20% I left out and record the results. This routine is wrapped in a loop as well so I can stabilize the model across different leave out sets. The idea is to see which model performs the best on average on the data it "never saw" before. Make changes to seeds, method, tunegrid, etc, for whatever stage of the analysis we are in. At this point, I had about 1000 models benchmark against each other, down from about 65k. Even at 1000, repeatedcv with a large tune grid, and looping over all that is still way too much unless we want to start it and walk away. I will try to narrow down to less than 50 or 100 models before doing extensive tuning across laplace, kernal, and adjust.
+
+Late edit... I've learned now that repeatedcv would effectively do the same thing as the outer forloop. Learned a lot, but it would seem I can consolidate code quite a bit. Shorted code after this chunk.
+
+```{r}
+
+library(stringr)
+library(tictoc)
+library(combinat)
+library(e1071)
+library(caret)
+library(doParallel)
+library(foreach)
+library(data.table)
+library(smotefamily)
+library(dplyr)
+
+num_cores = detectCores() - 2
+cl_outer <- makeCluster(num_cores)
+registerDoParallel(cl_outer)
+
+all_results <- list()
+itterations = 1:50
+#folds = 10
+
+#get all our models to deeply look at from our multitude of ways of looking for features
+
+models <- fread('final_candidates.csv')
+
+models$sorted_features <- sapply(models$features, sort_features)
+
+unique_combinations <- unique(models$sorted_features)
+
+tictoc::tic()
+foreach(i = itterations,
+        .combine = rbind,
+    .packages = c(
+      "stringr",
+      "combinat",
+      "e1071",
+      "caret",
+      'foreach',
+      'data.table',
+      'doParallel',
+      'dplyr'
+    ),
+    .inorder = FALSE
+        ) %do% {
+  
+  print(i)
+  
+ 
+  # seeds <- vector("list", length = folds + 1)
+  # 
+  # set.seed(i)
+  # for (j in 1:folds) {
+  #   seeds[[j]] <- sample.int(1000, 5)
+  # }
+  # 
+  # seeds[[folds + 1]] <- sample.int(1000, 1)
+  
+  #set folds and repeats for cv
+  folds = 10
+  repeats = 5
+
+  tune_grid <- expand.grid(
+    fL = seq(0, 5, by = .5),
+    usekernel = c(TRUE, FALSE),
+    adjust = seq(1, 5, by = .5)
+  )
+  
+  set.seed(i)
+  seeds <- generate_seeds(tune_grid, "cv", resampling_number = folds, adaptive = FALSE)          
+  
+  set.seed(i)
+  train_indices <- createDataPartition(data_all$Attrition, p = 0.8, list =
+                                         FALSE)
+  train_data <- data_all[train_indices, ]
+  test_data <- data_all[-train_indices, ]
+  
+  nzv <- nearZeroVar(train_data, saveMetrics = TRUE)
+  nzv_to_remove <- which(nzv$zeroVar == TRUE | nzv$nzv == TRUE)
+  columns_to_remove <- colnames(train_data)[nzv_to_remove]
+  train_data <- train_data %>% dplyr::select(-dplyr::all_of(columns_to_remove))
+  preprocess_steps <- preProcess(train_data, method = c("center", "scale", "nzv"))
+  train_data_processed <- predict(preprocess_steps, train_data)
+  
+  #test_data <- test_data %>% dplyr::select(-dplyr::all_of(columns_to_remove))
+  preprocess_steps <- preProcess(test_data, method = c("center", "scale", "nzv"))
+  test_data <- predict(preprocess_steps, test_data)
+  
+  
+  
+  results <- foreach(
+    m = unique_combinations,
+    .combine = rbind,
+    .packages = c(
+      "stringr",
+      "combinat",
+      "e1071",
+      "caret",
+      'dplyr',
+      'foreach',
+      'data.table',
+      'doParallel'
+    ),
+    .inorder = FALSE
+  ) %dopar% {
+    
+    
+    m_data <- train_data_processed %>% dplyr::select(all_of(strsplit(m, ",")[[1]]), "Attrition")
+    #m_data <- train_data %>% dplyr::select(all_of(strsplit(unique_combinations[1], ",")[[1]]), "Attrition")
+    
+    control_u <- trainControl(
+      method = "cv",
+      number = folds,
+      repeats = repeats,
+      summaryFunction = twoClassSummary,
+      sampling = "up",
+      allowParallel = TRUE,
+      savePredictions = 'all',
+      classProbs = TRUE,
+      seeds = seeds,
+      search = "grid"
+      #adaptive = list(min = 3, alpha = 0.05, method = "gls", complete = TRUE)
+    )
+    up_cv_model <- train(
+      m_data %>% dplyr::select(-Attrition),
+      m_data$Attrition,
+      method = "nb",
+      trControl = control_u,
+      tuneGrid = tune_grid,
+      metric = "ROC"
+    )
+    
+    control_d <- trainControl(
+      method = "cv",
+      number = folds,
+      repeats = repeats,
+      summaryFunction = twoClassSummary,
+      sampling = "down",
+      allowParallel = TRUE,
+      savePredictions = 'all',
+      classProbs = TRUE,
+      seeds = seeds,
+      search = "grid"
+      #adaptive = list(min = 3, alpha = 0.05, method = "gls", complete = TRUE)
+    )
+    down_cv_model <- train(
+      m_data %>% dplyr::select(-Attrition),
+      m_data$Attrition,
+      method = "nb",
+      trControl = control_d,
+      tuneGrid = tune_grid,
+      metric = "ROC"
+    )
+    
+    control_r <- trainControl(
+      method = "cv",
+      number = folds,
+      repeats = repeats,
+      summaryFunction = twoClassSummary,
+      sampling = "rose",
+      allowParallel = TRUE,
+      savePredictions = 'all',
+      classProbs = TRUE,
+      seeds = seeds,
+      search = "grid"
+      #adaptive = list(min = 3, alpha = 0.05, method = "gls", complete = TRUE)
+    )
+    rose_cv_model <- train(
+      m_data %>% dplyr::select(-Attrition),
+      m_data$Attrition,
+      method = "nb",
+      trControl = control_r,
+      tuneGrid = tune_grid,
+      metric = "ROC"
+    )
+    
+    suppressWarnings({
+      
+      df_up <- eval_model(up_cv_model, test_data, "Attrition", "Yes")
+      df_down <- eval_model(down_cv_model, test_data, "Attrition", "Yes")
+      df_rose <- eval_model(rose_cv_model, test_data, "Attrition", "Yes")
+    
+      df_up$seed <- i
+      df_down$seed <- i
+      df_rose$seed <- i
+    })
+    
+    
+    df_final <- rbind(df_up, df_down, df_rose)
+   
+    df_final    
+    # results <- rbindlist(list(results, df_final),
+    #                      use.names = TRUE,
+    #                      fill = TRUE)
+    
+  }
+   
+
+  file_name_part <- paste0("tune_data_part_", i, ".csv")
+  df <- as.data.frame(results)
+  write.csv(df, file=file_name_part, row.names = TRUE)
+  
+   all_results[[i]] <- results
+}
+
+final_results <- do.call(rbind, all_results)
+
+tictoc::toc()
+
+
+current_datetime <- format(Sys.time(), "%Y-%m-%d_%H-%M-%S")
+file_name <- paste0("tune_data_v2_", current_datetime, ".csv")
+results_df <- as.data.frame(final_results)
+write.csv(results_df, file=file_name, row.names = TRUE)
+
+
+
+# Get all active cluster objects
+active_clusters <- parallel:::getDefaultCluster()
+
+# Stop each active cluster
+if (!is.null(active_clusters)) {
+  for (cl in active_clusters) {
+    stopCluster(cl)
+  }
+}
+
+
+
+
+```
+
+Shorted code from above
+
+```{r}
+
+library(stringr)
+library(tictoc)
+library(combinat)
+library(caret)
+library(doParallel)
+library(foreach)
+library(data.table)
+library(smotefamily)
+library(dplyr)
+
+num_cores = detectCores() - 2
+cl_outer <- makeCluster(num_cores)
+registerDoParallel(cl_outer)
+
+all_results <- list()
+
+models <- fread('final_candidates.csv')
+
+models$sorted_features <- sapply(models$features, sort_features)
+
+unique_combinations <- unique(models$sorted_features)
+
+tictoc::tic()
+
+folds = 10
+repeats = 5
+
+  tune_grid <- expand.grid(
+    fL = seq(0, 5, by = .5),
+    usekernel = c(TRUE, FALSE),
+    adjust = seq(1, 5, by = .5)
+  )
+  
+
+  i = 1234
+  set.seed(i)
+  train_indices <- createDataPartition(data_all$Attrition, p = 0.8, list =FALSE)
+  train_data <- data_all[train_indices, ]
+  test_data <- data_all[-train_indices, ]
+  
+  nzv <- nearZeroVar(train_data, saveMetrics = TRUE)
+  nzv_to_remove <- which(nzv$zeroVar == TRUE | nzv$nzv == TRUE)
+  columns_to_remove <- colnames(train_data)[nzv_to_remove]
+  train_data <- train_data %>% dplyr::select(-dplyr::all_of(columns_to_remove))
+  preprocess_steps <- preProcess(train_data, method = c("center", "scale", "nzv"))
+  train_data_processed <- predict(preprocess_steps, train_data)
+  
+  preprocess_steps <- preProcess(test_data, method = c("center", "scale", "nzv"))
+  test_data <- predict(preprocess_steps, test_data)
+  
+  
+
+  results <- foreach(
+    m = unique_combinations,
+    .combine = rbind,
+    .packages = c(
+      "stringr",
+      "combinat",
+      "caret",
+      'dplyr',
+      'foreach',
+      'data.table',
+      'doParallel'
+    ),
+    .inorder = FALSE
+  ) %dopar% {
+    
+    
+    m_data <- train_data_processed %>% dplyr::select(all_of(strsplit(m, ",")[[1]]), "Attrition")
+    #m_data <- train_data %>% dplyr::select(all_of(strsplit(unique_combinations[1], ",")[[1]]), "Attrition")
+    
+    control_u <- trainControl(
+      method = "repeatedcv",
+      number = folds,
+      repeats = repeats,
+      summaryFunction = twoClassSummary,
+      sampling = "up",
+      allowParallel = TRUE,
+      savePredictions = 'all',
+      classProbs = TRUE,
+      #seeds = seeds,
+      search = "grid"
+      #adaptive = list(min = 3, alpha = 0.05, method = "gls", complete = TRUE)
+    )
+    up_cv_model <- train(
+      m_data %>% dplyr::select(-Attrition),
+      m_data$Attrition,
+      method = "nb",
+      trControl = control_u,
+      tuneGrid = tune_grid,
+      metric = "ROC"
+    )
+    
+    control_d <- trainControl(
+      method = "repeatedcv",
+      number = folds,
+      repeats = repeats,
+      summaryFunction = twoClassSummary,
+      sampling = "down",
+      allowParallel = TRUE,
+      savePredictions = 'all',
+      classProbs = TRUE,
+      #seeds = seeds,
+      search = "grid"
+      #adaptive = list(min = 3, alpha = 0.05, method = "gls", complete = TRUE)
+    )
+    down_cv_model <- train(
+      m_data %>% dplyr::select(-Attrition),
+      m_data$Attrition,
+      method = "nb",
+      trControl = control_d,
+      tuneGrid = tune_grid,
+      metric = "ROC"
+    )
+    
+    control_r <- trainControl(
+      method = "repeatedcv",
+      number = folds,
+      repeats = repeats,
+      summaryFunction = twoClassSummary,
+      sampling = "rose",
+      allowParallel = TRUE,
+      savePredictions = 'all',
+      classProbs = TRUE,
+      #seeds = seeds,
+      search = "grid"
+      #adaptive = list(min = 3, alpha = 0.05, method = "gls", complete = TRUE)
+    )
+    rose_cv_model <- train(
+      m_data %>% dplyr::select(-Attrition),
+      m_data$Attrition,
+      method = "nb",
+      trControl = control_r,
+      tuneGrid = tune_grid,
+      metric = "ROC"
+    )
+    
+    suppressWarnings({
+      
+      df_up <- eval_model(up_cv_model, test_data, "Attrition", "Yes")
+      df_down <- eval_model(down_cv_model, test_data, "Attrition", "Yes")
+      df_rose <- eval_model(rose_cv_model, test_data, "Attrition", "Yes")
+    
+      df_up$seed <- i
+      df_down$seed <- i
+      df_rose$seed <- i
+    })
+    
+    
+    df_final <- rbind(df_up, df_down, df_rose)
+   
+    df_final    
+   
+}
+
+
+tictoc::toc()
+
+
+current_datetime <- format(Sys.time(), "%Y-%m-%d_%H-%M-%S")
+file_name <- paste0("tune_data_v5", current_datetime, ".csv")
+results_df <- as.data.frame(results)
+write.csv(results_df, file=file_name, row.names = TRUE)
+
+
+
+# Get all active cluster objects
+active_clusters <- parallel:::getDefaultCluster()
+
+# Stop each active cluster
+if (!is.null(active_clusters)) {
+  for (cl in active_clusters) {
+    stopCluster(cl)
+  }
+}
+
+
+```
+
+Look at the data we created above. if necessary, further reduce and run through the top again. very subjective here. maybe if we get down to a 100 or so models, we can use repeatedcv with a big tuneGrid. very computationally expensive. adjust code above as necessary for performance.
+
+```{r}
+
+
+### if you need to group
+tune_data <- fread('tune_data_final_perm_2024-10-29_16-07-22.csv')
+
+tune_data <- tune_data %>% group_by(model, features, usekernel, adjust, fL) %>% 
+  summarise(
+  thresholddiff = abs(mean(predicted_threshold) - mean(actual_threshold)),
+  predicted_threshold = mean(predicted_threshold),
+  actual_threshold = mean(actual_threshold),
+  acc_diff = abs(mean(predicted_acc) - mean(actual_acc)),
+  sen_diff = abs(mean(predicted_sen) - mean(actual_sen)),
+  spec_diff = abs(mean(predicted_spec) - mean(actual_spec)),
+  predicted_acc = mean(predicted_acc),
+  predicted_sen = mean(predicted_sen),
+  predicted_spec = mean(predicted_spec),
+  predicted_roc = mean(predicted_roc),
+  actual_acc = mean(actual_acc),
+  actual_sen = mean(actual_sen),
+  actual_spec = mean(actual_spec)
+)
+
+tune_data <- tune_data %>% filter(actual_acc > .75 &
+                                    actual_sen > .75 & actual_spec > .75)
+
+
+write_csv(tune_data, "final_candidates.csv")
+
+b <- tune_data[which.min(tune_data$acc_diff + tune_data$sen_diff + tune_data$spec_diff) , ]
+print(b)
+
+
+
+###if you don't need to group
+tune_data <- results %>% mutate(
+  thresholddiff = abs(predicted_threshold - actual_threshold),
+  acc_diff = abs(predicted_acc - actual_acc),
+  sen_diff = abs(predicted_sen - actual_sen),
+  spec_diff = abs(predicted_spec - actual_spec)
+)
+
+tune_data <- tune_data %>% filter(actual_acc > .75 &
+                                    actual_sen > .75 & actual_spec > .75)
+
+b <- tune_data[which.min(tune_data$acc_diff + tune_data$sen_diff + tune_data$spec_diff) , ]
+print(b)
+
+
+
+combined_data <- combined_data %>% group_by(model, features) %>% 
+  summarise(
+  thresholddiff = abs(mean(predicted_threshold) - mean(actual_threshold)),
+  predicted_threshold = mean(predicted_threshold),
+  actual_threshold = mean(actual_threshold),
+  acc_diff = abs(mean(predicted_acc) - mean(actual_acc)),
+  sen_diff = abs(mean(predicted_sen) - mean(actual_sen)),
+  spec_diff = abs(mean(predicted_spec) - mean(actual_spec)),
+  predicted_acc = mean(predicted_acc),
+  predicted_sen = mean(predicted_sen),
+  predicted_spec = mean(predicted_spec),
+  actual_acc = mean(actual_acc),
+  actual_sen = mean(actual_sen),
+  actual_spec = mean(actual_spec)
+)
+
+
+
+
+
+```
+
+Attempted caretEnsemble for fun, didn't end up using.
+
+```{r}
+
+d <- fread('finals.csv')
+
+d <- d %>% filter(actual_acc > .75 &
+                                    actual_sen > .75 & actual_spec > .75)
+
+library(caretEnsemble)
+
+  train_indices <- createDataPartition(data_all$Attrition, p = 0.8, list =FALSE)
+  train_data <- data_all[train_indices, ]
+  test_data <- data_all[-train_indices, ]
+  
+  nzv <- nearZeroVar(train_data, saveMetrics = TRUE)
+  nzv_to_remove <- which(nzv$zeroVar == TRUE | nzv$nzv == TRUE)
+  columns_to_remove <- colnames(train_data)[nzv_to_remove]
+  train_data <- train_data %>% dplyr::select(-dplyr::all_of(columns_to_remove))
+  preprocess_steps <- preProcess(train_data, method = c("center", "scale", "nzv"))
+  train_data_processed <- predict(preprocess_steps, train_data)
+  
+  preprocess_steps <- preProcess(test_data, method = c("center", "scale", "nzv"))
+  test_data <- predict(preprocess_steps, test_data)
+
+m_spec = 'JobInvolvement,JobRole,JobSatisfaction,MonthlyIncome_L,OverTime,StockOptionLevel,WorkLifeBalance,YearsWithCurrManager' # highest spec
+m_sen = 'Department,JobInvolvement,JobRole,JobSatisfaction,MonthlyIncome_L,OverTime,StockOptionLevel,YearsWithCurrManager' #highest sen
+
+
+
+mspec_data <- train_data_processed %>% dplyr::select(all_of(strsplit(m_spec, ",")[[1]]), "Attrition")
+msen_data <- train_data_processed %>% dplyr::select(all_of(strsplit(m_sen, ",")[[1]]), "Attrition")
+
+
+library(caretEnsemble)
+
+folds=10
+repeats=5
+
+myControl <- trainControl(method='cv', number=folds, repeats=repeats,
+                          returnResamp='none', classProbs=TRUE,
+                          returnData=FALSE, savePredictions=TRUE,
+                          verboseIter=TRUE, allowParallel=TRUE,
+                          summaryFunction=twoClassSummary,
+                          index=createMultiFolds(m_data, k=folds, times=repeats))
+# PP <- c('center', 'scale')
+
+tune_grid_m_spec <- expand.grid(
+    fL = 4.5,
+    usekernel = TRUE,
+    adjust = 4
+)
+
+tune_grid_m_sen <- expand.grid(
+    fL = 2.5,
+    usekernel = TRUE,
+    adjust = 1
+)
+
+
+control_m_spec <- trainControl(
+      method = "repeatedcv",
+      number = folds,
+      repeats = repeats,
+      summaryFunction = twoClassSummary,
+      sampling = "up",
+      allowParallel = TRUE,
+      savePredictions = 'all',
+      classProbs = TRUE,
+      #seeds = seeds,
+      search = "grid"
+      #adaptive = list(min = 3, alpha = 0.05, method = "gls", complete = TRUE)
+  )
+
+control_m_sen <- trainControl(
+      method = "repeatedcv",
+      number = folds,
+      repeats = repeats,
+      summaryFunction = twoClassSummary,
+      sampling = "rose",
+      allowParallel = TRUE,
+      savePredictions = 'all',
+      classProbs = TRUE,
+      #seeds = seeds,
+      search = "grid"
+      #adaptive = list(min = 3, alpha = 0.05, method = "gls", complete = TRUE)
+  )
+
+model_spec <- train(
+      mspec_data %>% dplyr::select(-Attrition),
+      mspec_data$Attrition,
+      method = "nb",
+      trControl = control_m_spec,
+      tuneGrid = tune_grid_m_spec,
+      metric = "ROC"
+    )
+
+model_sen <- train(
+      m_data %>% dplyr::select(-Attrition),
+      m_data$Attrition,
+      method = "nb",
+      trControl = control_m_sen,
+      tuneGrid = tune_grid_m_sen,
+      metric = "ROC"
+    )
+
+#Train some models
+#model_spec <- train(mspec_data %>% select(-Attrition), mspec_data$Attrition, method='nb', trControl=control_m_spec, tuneGrid=)
+#model_sen <- train(msen_data %>% select(-Attrition), msen_data$Attrition, method='nb', trControl=myControl, tuneGrid=)
+#model3 <- train(m_data %>% select(-Attrition), m_data$Attrition, method='nb', trControl=myControl, tuneGrid=expand.grid(.n.trees=500, .interaction.depth=15, .shrinkage = 0.01))
+
+
+#Make a list of all the models
+all.models <- list(model_spec, model_sen)
+names(all.models) <- sapply(all.models, function(x) x$method)
+sort(sapply(all.models, function(x) min(x$results$ROC)))
+
+#Make a greedy ensemble - currently can only use RMSE
+greedy <- caretEnsemble(all.models, iter=1000L)
+sort(greedy$weights, decreasing=TRUE)
+greedy$error
+
+#Make a linear regression ensemble
+
+linear <- caretStack(all.models, method='glm', trControl=myControl)
+linear$error
+
+#Predict for test set:
+library(caTools)
+preds <- data.frame(sapply(all.models, function(x){predict(x, X[!train,], type='prob')[,2]}))
+preds$ENS_greedy <- predict(greedy, newdata=X[!train,])
+preds$ENS_linear <- predict(linear, newdata=X[!train,], type='prob')[,2]
+sort(data.frame(colAUC(preds, Y[!train])))
+
+
+```
+
+Testing a few models to see if they are actually as good as the results imply.
+
+```{r}
+
+library(stringr)
+library(tictoc)
+library(combinat)
+library(e1071)
+library(caret)
+library(doParallel)
+library(foreach)
+library(data.table)
+library(smotefamily)
+library(dplyr)
+
+
+
+num_cores = detectCores() - 2
+cl_outer <- makeCluster(num_cores)
+registerDoParallel(cl_outer)
+
+all_results <- list()
+itterations = 201:301
+#folds = 10
+
+#f <- fread('finals.csv')
+
+f <- data.frame(features = c("Department,JobInvolvement,JobLevel,OverTime,StockOptionLevel,WorkLifeBalance,YearsWithCurrManager","Age,JobInvolvement,JobRole,JobSatisfaction,MonthlyIncome_L,OverTime,StockOptionLevel,WorkLifeBalance"), model = c("up","up"), usekernel = c(TRUE, TRUE), adjust = c(1,3), fL = c(5,3))
+
+tictoc::tic()
+foreach(i = itterations,
+        .combine = rbind,
+    .packages = c(
+      "stringr",
+      "combinat",
+      "e1071",
+      "caret",
+      'foreach',
+      'data.table',
+      'doParallel',
+      'dplyr'
+    ),
+    .inorder = FALSE
+        ) %do% {
+  
+  print(i)
+  
+  #set folds and repeats for cv
+  folds = 10
+  repeats = 5
+
+  
+  set.seed(i)
+  train_indices <- createDataPartition(data_all$Attrition, p = 0.8, list =
+                                         FALSE)
+  train_data <- data_all[train_indices, ]
+  test_data <- data_all[-train_indices, ]
+  
+  nzv <- nearZeroVar(train_data, saveMetrics = TRUE)
+  nzv_to_remove <- which(nzv$zeroVar == TRUE | nzv$nzv == TRUE)
+  columns_to_remove <- colnames(train_data)[nzv_to_remove]
+  train_data <- train_data %>% dplyr::select(-dplyr::all_of(columns_to_remove))
+  preprocess_steps <- preProcess(train_data, method = c("center", "scale", "nzv"))
+  train_data_processed <- predict(preprocess_steps, train_data)
+  
+  #test_data <- test_data %>% dplyr::select(-dplyr::all_of(columns_to_remove))
+  preprocess_steps <- preProcess(test_data, method = c("center", "scale", "nzv"))
+  test_data <- predict(preprocess_steps, test_data)
+  
+  
+   results <- foreach(
+    mm = seq_len(nrow(f)),
+    .combine = rbind,
+    .packages = c(
+      "stringr",
+      "combinat",
+      "e1071",
+      "caret",
+      'dplyr',
+      'foreach',
+      'data.table',
+      'doParallel'
+    ),
+    .inorder = FALSE
+  ) %dopar% {
+  
+  mm_row <- f[mm,]  
+    
+  tune_grid <- expand.grid(
+  fL = mm_row$fL,          # Laplace smoothing parameter
+  usekernel = mm_row$usekernel,  # Use kernel density estimates
+  adjust = mm_row$adjust       # Bandwidth adjustment for density estimation
+  )
+
+  #m = "Department,Gender,JobInvolvement,JobLevel,JobSatisfaction,OverTime,StockOptionLevel,WorkLifeBalance"
+  m_data <- train_data_processed %>% dplyr::select(all_of(strsplit(mm_row$features, ",")[[1]]), "Attrition")  
+  
+
+    
+    control <- trainControl(
+      method = "repeatedcv",
+      number = folds,
+      repeats = repeats,
+      summaryFunction = twoClassSummary,
+      sampling = mm_row$model,
+      allowParallel = TRUE,
+      savePredictions = 'final',
+      classProbs = TRUE,
+      #seeds = seeds,
+      search = "grid"
+      #adaptive = list(min = 3, alpha = 0.05, method = "gls", complete = TRUE)
+    )
+    f_model <- train(
+      m_data %>% dplyr::select(-Attrition),
+      m_data$Attrition,
+      method = "nb",
+      trControl = control,
+      tuneGrid = tune_grid,
+      metric = "ROC"
+    )
+    
+    suppressWarnings({
+      
+      #df_up <- eval_model(up_cv_model, test_data, "Attrition", "Yes")
+      #df_down <- eval_model(down_cv_model, test_data, "Attrition", "Yes")
+      df <- eval_model(f_model, test_data, "Attrition", "Yes")
+    
+      #df_up$seed <- i
+      #df_down$seed <- i
+      df$seed <- i
+    })
+   
+   
+    df
+  }
+   j = i - 200
+   all_results[[j]] <- results
+}
+
+tictoc::toc()
+
+final_results <- list()
+final_results <- do.call(rbind, all_results)
+
+current_datetime <- format(Sys.time(), "%Y-%m-%d_%H-%M-%S")
+file_name <- paste0("tune_data_final_perm_", current_datetime, ".csv")
+results_df <- as.data.frame(final_results)
+write.csv(results_df, file=file_name, row.names = TRUE)
+
+
+# Get all active cluster objects
+active_clusters <- parallel:::getDefaultCluster()
+
+# Stop each active cluster
+if (!is.null(active_clusters)) {
+  for (cl in active_clusters) {
+    stopCluster(cl)
+  }
+}
+
+# tune_data <- r %>% 
+#   summarise(
+#   thresholddiff = abs(mean(predicted_threshold) - mean(actual_threshold)),
+#   predicted_threshold = mean(predicted_threshold),
+#   actual_threshold = mean(actual_threshold),
+#   acc_diff = abs(mean(predicted_acc) - mean(actual_acc)),
+#   sen_diff = abs(mean(predicted_sen) - mean(actual_sen)),
+#   spec_diff = abs(mean(predicted_spec) - mean(actual_spec)),
+#   predicted_acc = mean(predicted_acc),
+#   predicted_sen = mean(predicted_sen),
+#   predicted_spec = mean(predicted_spec),
+#   actual_acc = mean(actual_acc),
+#   actual_sen = mean(actual_sen),
+#   actual_spec = mean(actual_spec)
+# )
+
+```
