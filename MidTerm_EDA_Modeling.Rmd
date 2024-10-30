@@ -20,6 +20,7 @@ Next, I train my final mode and output predictions. All chunks after this one ar
 library(data.table)
 library(tidyverse)
 library(caret)
+library(dplyr)
 
 data_raw <- fread('CaseStudy1-data.csv')
 
@@ -201,12 +202,12 @@ sort_features <- function(x) {
 
 f <- data.frame(
   features = c(
-    "Age,JobInvolvement,JobRole,JobSatisfaction,MonthlyIncome_L,OverTime,StockOptionLevel,WorkLifeBalance"
+    "Department,JobInvolvement,JobLevel,OverTime,StockOptionLevel,WorkLifeBalance,YearsWithCurrManager"
   ),
   model = c("up"),
   usekernel = c(TRUE),
-  adjust = c(3),
-  fL = c(3)
+  adjust = c(1),
+  fL = c(5)
 )
 
 
@@ -346,6 +347,15 @@ p_intro <- DataExplorer::plot_intro(data_raw) +
  
 
 p_intro
+```
+
+Automated EDA Report Creation
+
+```{r}
+library(DataExplorer)
+
+DataExplorer::create_report(data_all)
+
 ```
 
 Chi Squared Tests
